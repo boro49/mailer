@@ -1,0 +1,6 @@
+# Ignoruj foldery
+example/
+generated_mails/
+
+# Ignoruj konkretny plik w katalogu mailer/
+wszystkie_paczki.zip
