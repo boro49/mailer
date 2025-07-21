@@ -71,6 +71,53 @@ def download_image(image_url, dest_folder):
         st.error(f"Błąd pobierania obrazu z {image_url}: {e}")
         return None
 
+def append_query_params_to_links(html, query_string):
+    """
+    Dodaje `query_string` do każdego href w HTML.
+    Obsługuje przypadki z istniejącym ? lub bez.
+    """
+    def replacer(match):
+        href = match.group(1)
+        if "mailto:" in href or "tel:" in href:
+            return match.group(0)
+        if "?" in href:
+            return f'href="{href}&{query_string}"'
+        else:
+            return f'href="{href}?{query_string}"'
+
+    return re.sub(r'href=["\'](.*?)["\']', replacer, html)
+
+def append_query_param_once(html, param_string="a={{akcja}}"):
+    """
+    Dodaje ?a={{akcja}} lub &a={{akcja}} do każdego href="..." w HTML, jeśli jeszcze nie zawiera takiego parametru.
+    Unika duplikatów i nie modyfikuje mailto:/tel: ani już przerobionych linków.
+    """
+    def replacer(match):
+        href = match.group(1)
+
+        # Pomiń tel: mailto: i javascript:
+        if href.startswith(("mailto:", "tel:", "javascript:")):
+            return match.group(0)
+
+        # Jeśli parametr już istnieje — pomiń
+        if "a={{" in href:
+            return match.group(0)
+
+        # Rozdziel URL i hash (np. #anchor)
+        parts = href.split("#")
+        url = parts[0]
+        hash_part = "#" + parts[1] if len(parts) > 1 else ""
+
+        # Dodaj parametry
+        if "?" in url:
+            url += f"&{param_string}"
+        else:
+            url += f"?{param_string}"
+
+        return f'href="{url}{hash_part}"'
+
+    return re.sub(r'href=["\'](.*?)["\']', replacer, html)
+
 
 def embed_image_as_data_uri(image_path):
     """Odczytuje obraz z podanej ścieżki i zwraca data URI (base64)."""
@@ -166,7 +213,7 @@ def process_scrape_csv(file_bytes):
     CSV powinien zawierać kolumny: ID, url1, url2.
     Dla url1 i url2 scrapuje tytuł (H1), adres URL obrazu (div.entry-image > img) oraz lead (div.entry-lead)
     i dodaje do danych nowe kolumny:
-      title1, img1, lead1, title2, img2, lead2.
+      title1, img1_url, lead1, title2, img2_url, lead2.
     Zwraca listę słowników (każdy odpowiada wierszowi).
     """
     file_io = io.StringIO(file_bytes.decode('utf-8-sig'))
@@ -180,24 +227,24 @@ def process_scrape_csv(file_bytes):
             data1 = scrap_page(row["url1"])
             row["url1"] = row["url1"]
             row["title1"] = data1["title"]
-            row["img1"] = data1["img"]
+            row["img1_url"] = data1["img"]
             row["lead1"] = data1["lead"]
         else:
             row["url1"] = row["url1"]
             row["title1"] = ""
-            row["img1"] = ""
+            row["img1_url"] = ""
             row["lead1"] = ""
         # Scrapowanie dla url2
         if "url2" in row and row["url2"]:
             data2 = scrap_page(row["url2"])
             row["url2"] = row["url2"]
             row["title2"] = data2["title"]
-            row["img2"] = data2["img"]
+            row["img2_url"] = data2["img"]
             row["lead2"] = data2["lead"]
         else:
             row["url2"] = row["url2"]
             row["title2"] = ""
-            row["img2"] = ""
+            row["img2_url"] = ""
             row["lead2"] = ""
     return reader
 
@@ -211,6 +258,9 @@ def process_csv(data_rows, template_code, naming_variable, dynamic_image_columns
     zip_files = []
     template_obj = Template(template_code)
     for row_index, row in enumerate(data_rows, start=1):
+
+        row["zmienne"] = "?a={{akcja}}"
+
         if naming_variable and naming_variable in row and row[naming_variable]:
             package_identifier = row[naming_variable]
         else:
@@ -219,30 +269,22 @@ def process_csv(data_rows, template_code, naming_variable, dynamic_image_columns
         package_folder = os.path.join(OUTPUT_FOLDER, f"{package_identifier}")
         os.makedirs(package_folder, exist_ok=True)
         
-        # Przetwarzanie każdej wybranej kolumny z dynamicznym obrazem
-        if dynamic_image_columns:
-            for col in dynamic_image_columns:
-                if col in row and row[col]:
-                    # Jeśli wartość zaczyna się od "http", pobieramy obraz z internetu.
-                    if row[col].startswith("http"):
-                        image_path = download_image(row[col], package_folder)
-                        if image_path:
-                            row[col] = os.path.basename(image_path)
-                        else:
-                            row[col] = row[col]
-                    # Jeśli wartość zaczyna się od "data:", zapisujemy ją do pliku.
-                    elif row[col].startswith("data:"):
-                        image_path = save_data_uri_as_file(row[col], package_folder, default_filename=col)
-                        if image_path:
-                            row[col] = os.path.basename(image_path)
-                        else:
-                            row[col] = row[col]
-                    else:
-                        row[col] = row[col]
-
+        # Obsługa wyłącznie kolumny 'logo'
+        if 'logo' in row and row['logo']:
+            image_path = download_image(row['logo'], package_folder)
+            if image_path:
+                row['logo'] = os.path.basename(image_path)
+            else:
+                row['logo'] = row['logo']
 
         try:
-            rendered_html = template_obj.render(**row)
+            # Pierwsze renderowanie (uzupełnia {{zmienne}})
+            intermediate_html = template_obj.render(**row)
+
+            # Drugie renderowanie (uzupełnia np. {{akcja}})
+            final_template = Template(intermediate_html)
+            rendered_html = final_template.render(**row)
+            
         except Exception as e:
             st.error(f"Błąd renderowania (pakiet {package_identifier}): {e}")
             continue
@@ -286,8 +328,6 @@ def inline_base_images(html_text, base_folder):
             return match.group(0)
     pattern = re.compile(r'src=["\'](.*?)["\']')
     return pattern.sub(replace_src, html_text)
-
-def generate_preview(file_bytes, template_code, dynamic_image_columns=None):
     """
     Generuje podgląd dla pierwszego wiersza. Jeśli w st.session_state.scraped_data 
     znajdują się dane (lista słowników), to użyjemy pierwszego wiersza z tych danych.
@@ -310,21 +350,21 @@ def generate_preview(file_bytes, template_code, dynamic_image_columns=None):
     os.makedirs(preview_folder, exist_ok=True)
     
     # Przetwarzanie dynamicznych kolumn obrazów
-    if dynamic_image_columns:
-        for col in dynamic_image_columns:
-            if col in preview_row and preview_row[col]:
-                # Jeśli wartość zaczyna się od "http", pobieramy obraz i konwertujemy na Data URI.
-                if preview_row[col].startswith("http"):
-                    image_path = download_image(preview_row[col], preview_folder)
-                    embedded_image = embed_image_as_data_uri(image_path)
-                    preview_row[col] = embedded_image if embedded_image else preview_row[col]
-                # Jeśli już jest Data URI – pozostawiamy taką wartość.
-                elif preview_row[col].startswith("data:"):
-                    preview_row[col] = preview_row[col]
+    if 'logo' in preview_row and preview_row['logo']:
+        image_path = download_image(preview_row['logo'], preview_folder)
+        embedded_image = embed_image_as_data_uri(image_path)
+        preview_row['logo'] = embedded_image if embedded_image else preview_row['logo']
     
     try:
         template_obj = Template(template_code)
-        preview_html = template_obj.render(**preview_row)
+        
+        # Pierwsze renderowanie (uzupełnia {{zmienne}})
+        intermediate_html = template_obj.render(**row)
+
+        # Drugie renderowanie (uzupełnia np. {{akcja}})
+        final_template = Template(intermediate_html)
+        rendered_html = final_template.render(**row)
+
     except Exception as e:
         st.error(f"Błąd podczas generowania podglądu: {e}")
         return None
@@ -347,6 +387,42 @@ def copy_button_html(text_to_copy, button_text="Kopiuj"):
 # ------------- INTERFEJS UŻYTKOWNIKA --------------------
 
 st.title("Generator Paczek Mailingowych z Scrapowaniem Danych")
+
+with st.sidebar.expander("📘 Legenda zmiennych w szablonie"):
+    st.markdown("### ✅ Minimalne dane z arkusza")
+    st.markdown("""
+- `ID` – unikalny identyfikator wiersza  
+- `url1` – adres pierwszego artykułu  
+- `url2` – adres drugiego artykułu  
+    """)
+
+    st.markdown("### 📰 Dane z artykułów (scrapowane)")
+    st.markdown("""
+- `title1` – tytuł z `url1` (nagłówek H1)  
+- `lead1` – lead z `url1` (krótkie wprowadzenie)  
+- `img1_url` – adres URL obrazka z `url1` (np. `<img src="{{ img1_url }}">`)  
+
+- `title2` – tytuł z `url2`  
+- `lead2` – lead z `url2`  
+- `img2_url` – adres URL obrazka z `url2_url`  
+    """)
+
+    st.markdown("### ➕ Dodatkowe dane w arkuszu")
+    st.markdown("""
+- `logo` – adres URL logotypu (będzie pobrany i osadzony lokalnie)  
+- `url`  
+- `color`
+- `preheader`   
+- `text_header`  
+- `text`  
+- `banner_title`  
+- `banner_text`  
+- `cover_img` 
+    """)
+
+    st.markdown("### 🧩 Zastosowanie zmiennych w szablonie")
+    st.code("{{ title1 }}", language="jinja")
+
 
 st.header("1. Wgraj dane (CSV)")
 uploaded_csv = st.file_uploader("Wgraj plik CSV (kolumny: ID; url1; url2)", type=["csv"], key="csv_uploader")
@@ -373,16 +449,33 @@ if uploaded_csv:
             st.error("Błąd podczas scrapowania danych.")
 
 st.markdown("---")
-st.header("3. Wgraj szablon maila (ZIP)")
-uploaded_zip = st.file_uploader("Wgraj plik ZIP zawierający szablon (index.html + grafiki)", type=["zip"], key="zip_uploader")
-if uploaded_zip:
-    template_path = extract_template_zip(uploaded_zip)
-    if template_path:
-        global_template_code = load_template_from_file(template_path)
-        if global_template_code:
-            st.success("Szablon został wczytany.")
-            st.subheader("Podgląd szablonu HTML")
-            st.code(global_template_code, language="html")
+st.header("3. Wgraj szablon maila (ZIP lub HTML) – opcjonalnie")
+st.markdown("Możesz wgrać własny szablon w formacie `.zip` (z plikiem `index.html`) lub bezpośrednio jako `.html`. Jeśli nic nie wgrasz – użyjemy domyślnego szablonu.")
+
+uploaded_template = st.file_uploader(
+    "Wgraj szablon HTML lub ZIP",
+    type=["zip", "html"],
+    key="template_uploader"
+)
+
+
+if uploaded_template:
+    if uploaded_template.name.endswith(".zip"):
+        template_path = extract_template_zip(uploaded_template)
+        if template_path:
+            global_template_code = load_template_from_file(template_path)
+    elif uploaded_template.name.endswith(".html"):
+        global_template_code = uploaded_template.read().decode("utf-8")
+
+if not global_template_code:
+    st.info("Używasz domyślnego szablonu.")
+    try:
+        with open("default_template/index.html", "r", encoding="utf-8") as f:
+            global_template_code = f.read()
+    except Exception as e:
+        st.error("Nie udało się załadować domyślnego szablonu.")
+
+
 
 st.markdown("---")
 st.header("4. Wybór zmiennej na nazwę paczki")
@@ -394,19 +487,6 @@ naming_variable = st.selectbox(
 st.markdown("---")
 st.header("5. Podgląd / Generowanie paczek")
 col1, col2 = st.columns(2)
-
-with col1:
-    if st.button("Generuj Podgląd paczki"):
-        if not uploaded_csv or not global_template_code:
-            st.error("Wgraj plik CSV oraz szablon ZIP!")
-        else:
-            used_vars = get_used_template_variables(global_template_code)
-            dynamic_images = [col for col in ["img1", "img2"] if col in used_vars]
-            preview_html = generate_preview(uploaded_csv.getvalue(), global_template_code, dynamic_image_columns=dynamic_images)
-            if preview_html:
-                st.markdown("### Podgląd wygenerowanego HTML:")
-                st.components.v1.html(preview_html, height=600, scrolling=True)
-
 
 with col2:
     if st.button("Generuj wszystkie paczki"):
@@ -421,8 +501,8 @@ with col2:
             if data_rows:
                 naming_var = None if naming_variable == "Domyślne numerowanie" else naming_variable
                 used_vars = get_used_template_variables(global_template_code)
-                dynamic_images = [col for col in ["img1", "img2"] if col in used_vars]
-                zip_files = process_csv(data_rows, global_template_code, naming_var, dynamic_image_columns=dynamic_images)
+                dynamic_images = [col for col in ["img1_url", "img2_url"] if col in used_vars]
+                zip_files = process_csv(data_rows, global_template_code, naming_var)
                 # Później przyciski do pobrania paczek...
                 if zip_files:
                     st.success("Generowanie paczek zakończone!")
